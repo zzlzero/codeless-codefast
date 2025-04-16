@@ -38,7 +38,7 @@ class MBXP(Task):
             #"\ndef","\nassert","\nclass",'\n"""', "\nprint", "\nif", "\n<|/","\n#", "\n@"
             requires_execution=True,
         )
-        self.dataset = self.dataset["test"]
+        # self.dataset = self.dataset["test"]
         self.dataset_dir = problem_path_dict[self.DATASET_NAME]
         # self.demonstration = None
         # self.n_shot =None
@@ -95,7 +95,7 @@ class MBXP(Task):
             if stop_index != -1 and stop_index < min_stop_index:
                 min_stop_index = stop_index
         return decoded_string[:min_stop_index]
-    def postprocess_generation(self, generation, idx):
+    def postprocess_generation(self, generation, prompt):
         """Defines the postprocessing for a LM generation.
         :param generation: str
             code generation from LM
@@ -109,7 +109,6 @@ class MBXP(Task):
 
         #     generation = generation[len(prompt) :]
         #     return  self.current_func_name + self._stop_at_stop_token(generation, self.stop_words)
-        prompt = self.get_prompt(self.dataset[idx])
         generation = generation[len(prompt) :]
         # generation =  generation.replace('\t','    ')
         return prompt+ self._stop_at_stop_token(generation, self.stop_words)
