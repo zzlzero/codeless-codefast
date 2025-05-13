@@ -16,8 +16,69 @@ import threading
 import time
 from lm_eval.tasks.mbxp import MBXP
 from lm_eval.tasks.custom_metrics.multiple_metrics.containerized_eval import eval_string_script
-language = 'cpp'
-task = MBXP(language=language)
+from datasets import concatenate_datasets
+from execution import (
+    check_correctness,
+    check_correctness_cpp,
+    check_correctness_csharp,
+    check_correctness_go,
+    check_correctness_java,
+    check_correctness_javascript,
+    check_correctness_kotlin,
+    check_correctness_perl,
+    check_correctness_php,
+    check_correctness_ruby,
+    check_correctness_scala,
+    check_correctness_swift,
+    check_correctness_typescript,
+)
+
+check_correctness_function_map = {
+        "python": check_correctness,
+        "java": check_correctness_java,
+        "javascript": check_correctness_javascript,
+        "typescript": check_correctness_typescript,
+        "kotlin": check_correctness_kotlin,
+        "ruby": check_correctness_ruby,
+        "php": check_correctness_php,
+        "cpp": check_correctness_cpp,
+        "csharp": check_correctness_csharp,
+        "go": check_correctness_go,
+        "perl": check_correctness_perl,
+        "scala": check_correctness_scala,
+        "swift": check_correctness_swift,
+    }
+
+mbgp = MBXP(language="go")
+mbjsp = MBXP(language="javascript")
+mbcpp = MBXP(language="cpp")
+task_map = {
+    "go": mbgp,
+    "javascript": mbjsp,
+    "cpp": mbcpp
+}
+
+mbgp_dataset = mbgp.get_dataset(use_train=True)
+mbcpp_dataset = mbcpp.get_dataset(use_train=True)
+mbjsp_dataset = mbjsp.get_dataset(use_train=True)
+
+# 拼接数据集并打乱
+SEED = 42 # 你可以选择任何整数作为种子
+
+combined_dataset = mbgp_dataset + mbcpp_dataset + mbjsp_dataset
+random.seed(SEED)
+random.shuffle(combined_dataset)
+
+test_go_dataset = mbgp.get_dataset(use_train=False)
+test_cpp_dataset = mbcpp.get_dataset(use_train=False)
+test_js_dataset = mbjsp.get_dataset(use_train=False)
+test_dataset = test_go_dataset + test_cpp_dataset + test_js_dataset
+random.seed(SEED) # 使用相同的种子以确保可复现性，如果需要不同的打乱顺序，可以使用不同的种子
+random.shuffle(test_dataset)
+
+
+# task = mbgp  # 默认选择go任务对象，可根据需要切换
+# language = "go"  # 默认语言，可根据需要切换
 
 ########################
 # Custom dataclasses
@@ -45,28 +106,34 @@ logger.addHandler(handler)
 # Reward functions
 ########################
 
-def len_reward_func(prompts, completions, **kwargs):
+def len_reward_func(prompts, completions, language, **kwargs):
+    
     rewards = []
     max_len = max(len(completion) for completion in completions)
-    for prompt, completion in zip(prompts, completions):
+    for prompt, completion, lang in zip(prompts, completions, language):
         generation = prompt + ' ' + completion
+        task = task_map[lang]
         generation = task.postprocess_generation(generation, prompt)
         rewards.append(0.5 - ((len(completion) - len(generation) + len(prompt) + 1) / (max_len - len(generation) + len(prompt) + 1 + 1e-6)))
     return rewards
 
 
-def correct_code_reward_func(prompts, completions, test, **kwargs):
+def correct_code_reward_func(prompts, completions, test, language, **kwargs):
+    
     rewards = []
     
-    for prompt, reference, completion in zip(prompts, test, completions):
+    for prompt, reference, completion, lang in zip(prompts, test, completions, language):
         generation = prompt + ' ' + completion
+        task = task_map[lang]
         generation = task.postprocess_generation(generation, prompt)
         # print(generation)
-        test_program = generation + "\n" + reference
+        # test_program = generation + "\n" + reference
 
-        result = eval_string_script(language, test_program)
+        result = check_correctness_function_map[lang](problem=reference, completion=generation, timeout=30)
+        
+        # result = eval_string_script(language, test_program)
         # print(result['stderr'])
-        if result["status"] == "OK":
+        if result["passed"] == True:
 
             # 返回码为0表示测试通过
             rewards.append(1.0)
@@ -80,7 +147,7 @@ def correct_code_reward_func(prompts, completions, test, **kwargs):
                     f.write(f"Prompt:\n{prompt}\n\nGeneration:\n{generation}\n\nTest:\n{reference}\n")
         else:
             # 测试失败
-            print(f"Test failed with error: {result['stderr']}")
+            print(f"Test failed with error: {result['result']}")
             rewards.append(0.0)        
         print(f"Reward: {rewards[-1]}")
     
@@ -127,9 +194,8 @@ def grpo_function(
     ###############
     # Load dataset from Hugging Face Hub
 
-    train_dataset = task.get_dataset(use_train=True)
+    train_dataset = combined_dataset
 
-    test_dataset = task.get_dataset(use_train=False)
 
     #########################
     # Instantiate DPO trainer
