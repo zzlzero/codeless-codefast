@@ -15,6 +15,7 @@ from trl import GRPOConfig, GRPOTrainer, get_peft_config, ModelConfig, TrlParser
 import threading
 import time
 from lm_eval.tasks.mbxp import MBXP
+from lm_eval.tasks.mbpp import MBPP
 from lm_eval.tasks.custom_metrics.multiple_metrics.containerized_eval import eval_string_script
 from datasets import concatenate_datasets
 from execution import (
@@ -48,16 +49,19 @@ check_correctness_function_map = {
         "scala": check_correctness_scala,
         "swift": check_correctness_swift,
     }
-
+mbxp_python = MBXP(language="python")
 mbgp = MBXP(language="go")
 mbjsp = MBXP(language="javascript")
 mbcpp = MBXP(language="cpp")
+mbpp = MBPP()
 task_map = {
     "go": mbgp,
     "javascript": mbjsp,
-    "cpp": mbcpp
+    "cpp": mbcpp,
+    "python": mbpp
 }
 
+mbpp_dataset = mbxp_python.get_dataset(use_train=True)
 mbgp_dataset = mbgp.get_dataset(use_train=True)
 mbcpp_dataset = mbcpp.get_dataset(use_train=True)
 mbjsp_dataset = mbjsp.get_dataset(use_train=True)
@@ -65,9 +69,10 @@ mbjsp_dataset = mbjsp.get_dataset(use_train=True)
 # 拼接数据集并打乱
 SEED = 42 # 你可以选择任何整数作为种子
 
-combined_dataset = mbgp_dataset + mbcpp_dataset + mbjsp_dataset
+combined_dataset = mbpp_dataset + mbgp_dataset + mbcpp_dataset + mbjsp_dataset
 random.seed(SEED)
 random.shuffle(combined_dataset)
+print(f"Combined dataset size: {len(combined_dataset)}")
 
 test_go_dataset = mbgp.get_dataset(use_train=False)
 test_cpp_dataset = mbcpp.get_dataset(use_train=False)
@@ -88,6 +93,7 @@ class ScriptArguments:
     dataset_id_or_path: str = ""
     dataset_splits: str = "train"
     tokenizer_name_or_path: str = None
+    gamma: float = 1.0  # 新增：长度惩罚权重参数
 
 
 ########################
@@ -106,16 +112,18 @@ logger.addHandler(handler)
 # Reward functions
 ########################
 
-def len_reward_func(prompts, completions, language, **kwargs):
-    
-    rewards = []
-    max_len = max(len(completion) for completion in completions)
-    for prompt, completion, lang in zip(prompts, completions, language):
-        generation = prompt + ' ' + completion
-        task = task_map[lang]
-        generation = task.postprocess_generation(generation, prompt)
-        rewards.append(0.5 - ((len(completion) - len(generation) + len(prompt) + 1) / (max_len - len(generation) + len(prompt) + 1 + 1e-6)))
-    return rewards
+def get_len_reward_func(gamma: float):
+    def len_reward_func(prompts, completions, language, **kwargs):
+        rewards = []
+        max_len = max(len(completion) for completion in completions)
+        for prompt, completion, lang in zip(prompts, completions, language):
+            generation = prompt + ' ' + completion
+            task = task_map[lang]
+            generation = task.postprocess_generation(generation, prompt)
+            base_reward = 0.5 - ((len(completion) - len(generation) + len(prompt) + 1) / (max_len - len(generation) + len(prompt) + 1 + 1e-6))
+            rewards.append(gamma * base_reward)
+        return rewards
+    return len_reward_func
 
 
 def correct_code_reward_func(prompts, completions, test, language, **kwargs):
@@ -128,27 +136,49 @@ def correct_code_reward_func(prompts, completions, test, language, **kwargs):
         generation = task.postprocess_generation(generation, prompt)
         # print(generation)
         # test_program = generation + "\n" + reference
+        if lang == "python":
+            reference = '\n'.join(reference)
+            test_program = generation + "\n" + reference
+            result = eval_string_script(lang, test_program)
+            if result["status"] == "OK":
 
-        result = check_correctness_function_map[lang](problem=reference, completion=generation, timeout=30)
+                # 返回码为0表示测试通过
+                rewards.append(1.0)
+                
+                # 记录成功样本
+                if torch.rand(1).item() < 0.10:  # 10% 的概率记录成功样本
+                    os.makedirs("completion_samples_mbpp", exist_ok=True)
+                    log_file = os.path.join("completion_samples_mbpp", "success_code_samples.txt")
+                    with open(log_file, "a") as f:
+                        f.write(f"\n\n==============\n")
+                        f.write(f"Prompt:\n{prompt}\n\nGeneration:\n{generation}\n\nTest:\n{reference}\n")
+            else:
+                # 测试失败
+                print(f"Test failed with error: {result['stderr']}")
+                rewards.append(0.0)        
+
+        
         
         # result = eval_string_script(language, test_program)
         # print(result['stderr'])
-        if result["passed"] == True:
-
-            # 返回码为0表示测试通过
-            rewards.append(1.0)
-            
-            # 记录成功样本
-            if torch.rand(1).item() < 0.10:  # 10% 的概率记录成功样本
-                os.makedirs("completion_samples_mbxp", exist_ok=True)
-                log_file = os.path.join("completion_samples_mbxp", "success_code_samples.txt")
-                with open(log_file, "a") as f:
-                    f.write(f"\n\n==============\n")
-                    f.write(f"Prompt:\n{prompt}\n\nGeneration:\n{generation}\n\nTest:\n{reference}\n")
         else:
-            # 测试失败
-            print(f"Test failed with error: {result['result']}")
-            rewards.append(0.0)        
+            result = check_correctness_function_map[lang](problem=reference, completion=generation, timeout=30)
+            if result["passed"] == True:
+
+                # 返回码为0表示测试通过
+                rewards.append(1.0)
+                
+                # 记录成功样本
+                if torch.rand(1).item() < 0.10:  # 10% 的概率记录成功样本
+                    os.makedirs("completion_samples_mbxp", exist_ok=True)
+                    log_file = os.path.join("completion_samples_mbxp", "success_code_samples.txt")
+                    with open(log_file, "a") as f:
+                        f.write(f"\n\n==============\n")
+                        f.write(f"Prompt:\n{prompt}\n\nGeneration:\n{generation}\n\nTest:\n{reference}\n")
+            else:
+                # 测试失败
+                print(f"Test failed with error: {result['result']}")
+                rewards.append(0.0)        
         print(f"Reward: {rewards[-1]}")
     
     return rewards
@@ -203,7 +233,7 @@ def grpo_function(
 
     trainer = GRPOTrainer(
       model=model_args.model_name_or_path,
-      reward_funcs=[len_reward_func, correct_code_reward_func],
+      reward_funcs=[get_len_reward_func(script_args.gamma), correct_code_reward_func],
       processing_class=tokenizer,
       args=training_args,
       train_dataset=train_dataset,
