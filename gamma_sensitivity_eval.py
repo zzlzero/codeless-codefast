@@ -106,6 +106,7 @@ def main():
     parser = argparse.ArgumentParser(description="Gamma sensitivity evaluation for MBPP")
     parser.add_argument("--gammas", type=str, default="0.1,0.5,1.0,2.0")
     parser.add_argument("--model_dir_template", type=str, default="runs/CodeLlama-7b-hf-gamma-{gamma}")
+    parser.add_argument("--checkpoints", type=str, default="", help="Comma-separated list of checkpoints (e.g. '100,200') or 'all'. If empty, evaluates final model.")
     parser.add_argument("--dataset", type=str, default="google-research-datasets/mbpp")
     parser.add_argument("--max_new_tokens", type=int, default=512)
     parser.add_argument("--timeout", type=int, default=10)
@@ -119,43 +120,67 @@ def main():
 
     rows = []
     for gamma in parse_gammas(args.gammas):
-        model_path = args.model_dir_template.format(gamma=gamma_to_suffix(gamma))
-        if not os.path.isdir(model_path):
-            print(f"[WARN] Skip gamma={gamma}, model path not found: {model_path}")
-            continue
+        base_model_path = args.model_dir_template.format(gamma=gamma_to_suffix(gamma))
+        
+        paths_to_eval = []
+        if args.checkpoints.lower() == "all":
+            import glob
+            for ckpt_dir in glob.glob(os.path.join(base_model_path, "checkpoint-*")):
+                if os.path.isdir(ckpt_dir):
+                    ckpt_name = os.path.basename(ckpt_dir)
+                    paths_to_eval.append((ckpt_name, ckpt_dir))
+            paths_to_eval.sort(key=lambda x: int(x[0].split("-")[1]) if "-" in x[0] and x[0].split("-")[1].isdigit() else 0)
+        elif args.checkpoints:
+            for ckpt in args.checkpoints.split(","):
+                ckpt = ckpt.strip()
+                if ckpt:
+                    paths_to_eval.append((f"checkpoint-{ckpt}", os.path.join(base_model_path, f"checkpoint-{ckpt}")))
+        else:
+            paths_to_eval.append(("final", base_model_path))
 
-        print(f"[INFO] Evaluating gamma={gamma} from {model_path}")
-        pass_at_1, avg_len, total = evaluate_one_model(
-            model_path=model_path,
-            dataset_name=args.dataset,
-            max_new_tokens=args.max_new_tokens,
-            timeout=args.timeout,
-            max_samples=args.max_samples,
-        )
-        row = {
-            "gamma": gamma,
-            "pass_at_1": round(pass_at_1, 6),
-            "avg_generation_length": round(avg_len, 2),
-            "num_samples": total,
-        }
-        rows.append(row)
+        for ckpt_name, model_path in paths_to_eval:
+            if not os.path.isdir(model_path):
+                print(f"[WARN] Skip gamma={gamma} {ckpt_name}, model path not found: {model_path}")
+                continue
 
-    rows = sorted(rows, key=lambda x: x["gamma"])
+            print(f"[INFO] Evaluating gamma={gamma} {ckpt_name} from {model_path}")
+            pass_at_1, avg_len, total = evaluate_one_model(
+                model_path=model_path,
+                dataset_name=args.dataset,
+                max_new_tokens=args.max_new_tokens,
+                timeout=args.timeout,
+                max_samples=args.max_samples,
+            )
+            row = {
+                "gamma": gamma,
+                "checkpoint": ckpt_name,
+                "pass_at_1": round(pass_at_1, 6),
+                "avg_generation_length": round(avg_len, 2),
+                "num_samples": total,
+            }
+            rows.append(row)
+
+    def sort_key(x):
+        ckpt = x["checkpoint"]
+        ckpt_num = int(ckpt.split("-")[1]) if "-" in ckpt and ckpt.split("-")[1].isdigit() else 0
+        return (x["gamma"], ckpt_num, ckpt)
+
+    rows = sorted(rows, key=sort_key)
 
     with open(args.output_json, "w", encoding="utf-8") as f:
         json.dump(rows, f, ensure_ascii=False, indent=2)
 
     with open(args.output_csv, "w", encoding="utf-8", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=["gamma", "pass_at_1", "avg_generation_length", "num_samples"])
+        writer = csv.DictWriter(f, fieldnames=["gamma", "checkpoint", "pass_at_1", "avg_generation_length", "num_samples"])
         writer.writeheader()
         writer.writerows(rows)
 
     with open(args.output_md, "w", encoding="utf-8") as f:
-        f.write("| gamma | Pass@1 | Avg Generation Length (tokens) | #Samples |\n")
-        f.write("|---:|---:|---:|---:|\n")
+        f.write("| gamma | checkpoint | Pass@1 | Avg Generation Length (tokens) | #Samples |\n")
+        f.write("|---:|---:|---:|---:|---:|\n")
         for row in rows:
             f.write(
-                f"| {row['gamma']} | {row['pass_at_1']:.4f} | {row['avg_generation_length']:.2f} | {row['num_samples']} |\\n"
+                f"| {row['gamma']} | {row['checkpoint']} | {row['pass_at_1']:.4f} | {row['avg_generation_length']:.2f} | {row['num_samples']} |\n"
             )
 
     print(f"[INFO] Saved: {args.output_json}")
